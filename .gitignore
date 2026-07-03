@@ -1,0 +1,42 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables and local config
+.env
+.env.*
+*.env
+.venv/
+venv/
+env/
+ENV/
+
+# Python packaging and distribution
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# Logs and runtime files
+logs/
+*.log
+*.sqlite3
+*.db
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Optional local files
+*.local

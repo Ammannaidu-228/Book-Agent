@@ -1,0 +1,478 @@
+"""
+FastAPI application for Lit-Pick recommendation engine
+Organized in modular agentic AI project structure
+"""
+import logging
+import os
+import sys
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from datetime import datetime
+import time
+import asyncio
+
+# Add parent directory to path to support running from src directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.config import settings
+from src.database import init_db, close_db, get_db
+from src.api import (
+    RecommendationRequest, RecommendationResponse, BookResponse,
+    EmotionClassificationRequest, EmotionClassificationResponse,
+    HealthCheckResponse, SearchRequest, SearchResponse
+)
+from src.core import get_recommendation_engine, get_classifier, get_rag_pipeline
+
+# Lock to prevent concurrent engine initialization
+engine_init_lock = asyncio.Lock()
+engine_init_task = None
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Global engine instance
+engine = None
+_initialization_error = None
+
+
+def json_safe(value, default=None):
+    """Convert pandas/numpy missing values into JSON-safe defaults."""
+    if value is None:
+        return default
+    try:
+        import pandas as pd
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+async def ensure_engine_ready():
+    """Ensure the recommendation engine is created and initialized (lazy)."""
+    global engine
+    if engine and getattr(engine, 'initialized', False):
+        return
+
+    async with engine_init_lock:
+        if engine and getattr(engine, 'initialized', False):
+            return
+
+        try:
+            # Create engine instance if missing
+            if engine is None:
+                engine = get_recommendation_engine()
+
+            # Load dataset and initialize in a thread to avoid blocking event loop
+            if os.path.exists("books_with_emotions.csv"):
+                import pandas as pd
+                books_df = pd.read_csv("books_with_emotions.csv")
+                await asyncio.to_thread(engine.initialize, books_df)
+            else:
+                logger.warning("books_with_emotions.csv not found; cannot initialize engine")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize engine lazily: {e}")
+            raise
+
+
+async def _background_engine_initialization():
+    """Background task to warm up the engine on startup."""
+    global engine_init_task
+    try:
+        await ensure_engine_ready()
+    except Exception as e:
+        logger.warning(f"Background engine initialization failed: {e}")
+    finally:
+        engine_init_task = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    global engine, _initialization_error
+    
+    # Startup
+    try:
+        logger.info("Starting up Lit-Pick backend...")
+        
+        # Initialize database
+        try:
+            await init_db()
+            logger.info("Database initialized successfully")
+        except Exception as e:
+            logger.warning(f"Database initialization failed (non-critical): {e}")
+        
+        # Load books data (import pandas lazily to avoid heavy startup import)
+        try:
+            logger.info("Loading books data...")
+            if not os.path.exists("books_with_emotions.csv"):
+                logger.warning("books_with_emotions.csv not found - engine will use lazy initialization")
+                engine = None
+            else:
+                # Defer loading of the dataset and initialization of heavy models until first request
+                logger.info("books_with_emotions.csv present — engine will initialize lazily on first use")
+                engine = None
+                global engine_init_task
+                engine_init_task = asyncio.create_task(_background_engine_initialization())
+        except Exception as e:
+            logger.warning(f"Engine initialization deferred: {e}")
+            engine = None
+        
+        logger.info("Lit-Pick backend started (models will load on first use)")
+    
+    except Exception as e:
+        _initialization_error = str(e)
+        logger.error(f"Error during startup: {e}")
+    
+    # Yield control to the application
+    yield
+    
+    # Shutdown
+    try:
+        logger.info("Shutting down Lit-Pick backend...")
+        await close_db()
+        logger.info("Backend shutdown complete")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+
+
+# Initialize FastAPI app with lifespan
+app = FastAPI(
+    title=settings.API_TITLE,
+    version=settings.API_VERSION,
+    description="AI-powered book recommendation engine using RAG, LLMs, and emotion classification",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health", response_model=HealthCheckResponse)
+async def health_check():
+    """Health check endpoint"""
+    try:
+        if _initialization_error:
+            logger.warning(f"Health check: Initialization error present: {_initialization_error}")
+        
+        # Check whether heavy components are loaded without instantiating them
+        classifier_loaded = False
+        rag_loaded = False
+        
+        try:
+            from src.core import classifier as classifier_module
+            from src.core import embeddings as embeddings_module
+
+            classifier_loaded = getattr(classifier_module, "_classifier", None) is not None
+            rag_loaded = getattr(embeddings_module, "_rag_pipeline", None) is not None
+
+        except Exception as e:
+            logger.warning(f"Could not inspect model modules: {e}")
+        
+        # Check database
+        db_connected = True
+        try:
+            db = get_db()
+            db["books"].find_one({}, {"_id": 1})
+        except Exception as e:
+            logger.warning(f"Database health check failed: {e}")
+            db_connected = False
+        
+        return HealthCheckResponse(
+            status="healthy",
+            version=settings.API_VERSION,
+            database_connected=db_connected,
+            vector_db_connected=rag_loaded,
+            model_loaded=classifier_loaded,
+            timestamp=datetime.utcnow()
+        )
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/recommend", response_model=RecommendationResponse)
+async def recommend(request: RecommendationRequest):
+    """
+    Get book recommendations
+    
+    Endpoint: POST /recommend
+    Returns recommendations based on a query book using semantic similarity
+    """
+    try:
+        try:
+            await ensure_engine_ready()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Engine initialization failed: {e}")
+        
+        start_time = time.time()
+        
+        # Run heavy recommendation work in thread pool to avoid blocking event loop
+        def get_recs():
+            return engine.get_recommendations(
+                book_title=request.book,
+                top_k=request.top_k,
+                include_emotions=request.include_emotions,
+                min_similarity=settings.SIMILARITY_THRESHOLD
+            )
+        
+        recommendations, query_info = await asyncio.to_thread(get_recs)
+        
+        if not query_info.get('found'):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Book '{request.book}' not found in database"
+            )
+        
+        # Convert to response format
+        recommendation_responses = [
+            BookResponse(
+                isbn13=book.get('isbn13', ''),
+                title=book.get('title', ''),
+                authors=book.get('authors'),
+                categories=book.get('category'),
+                description=book.get('document_preview'),
+                thumbnail=book.get('thumbnail'),
+                average_rating=book.get('rating'),
+                emotions=book.get('emotions'),
+                similarity_score=book.get('similarity_score'),
+                match_reason=book.get('match_reason')
+            )
+            for book in recommendations
+        ]
+        
+        processing_time = (time.time() - start_time) * 1000
+        
+        logger.info(f"Recommendation request for '{request.book}' completed in {processing_time:.2f}ms")
+        
+        return RecommendationResponse(
+            query_book=request.book,
+            recommendations=recommendation_responses,
+            total_results=len(recommendations),
+            processing_time_ms=processing_time
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in recommendation endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/classify-emotion", response_model=EmotionClassificationResponse)
+async def classify_emotion(request: EmotionClassificationRequest):
+    """
+    Classify emotions in text
+    
+    Endpoint: POST /classify-emotion
+    Performs zero-shot emotion classification on provided text
+    """
+    try:
+        classifier = get_classifier()
+        
+        emotions = await asyncio.to_thread(classifier.classify_text, request.text)
+        top_emotion = max(emotions, key=emotions.get)
+        confidence = emotions[top_emotion]
+        
+        return EmotionClassificationResponse(
+            text=request.text[:100],  # Return first 100 chars
+            emotions=emotions,
+            top_emotion=top_emotion,
+            confidence=confidence
+        )
+    
+    except Exception as e:
+        logger.error(f"Error classifying emotions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/search", response_model=SearchResponse)
+async def search_books(
+    query: str = Query(..., min_length=1),
+    limit: int = Query(10, ge=1, le=50)
+):
+    """
+    Search books by title or description
+    
+    Endpoint: GET /search
+    Performs semantic search across book titles and descriptions
+    """
+    try:
+        try:
+            await ensure_engine_ready()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Engine initialization failed: {e}")
+
+        results = await asyncio.to_thread(engine.search_books, query, limit)
+        
+        response_books = [
+            BookResponse(
+                isbn13=book.get('isbn13', ''),
+                title=book.get('title', ''),
+                authors=book.get('authors'),
+                categories=book.get('category'),
+                description=book.get('document_preview') or book.get('description'),
+                thumbnail=book.get('thumbnail'),
+                average_rating=book.get('rating') or book.get('average_rating'),
+                similarity_score=book.get('similarity_score')
+            )
+            for book in results
+        ]
+        
+        return SearchResponse(
+            query=query,
+            results=response_books,
+            total_found=len(response_books)
+        )
+    
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        logger.error(f"Error searching books: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/book/{book_title}")
+async def get_book_analysis(book_title: str):
+    """
+    Get detailed book analysis including emotions
+    
+    Endpoint: GET /book/{book_title}
+    Returns book metadata and emotion analysis
+    """
+    try:
+        try:
+            await ensure_engine_ready()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Engine initialization failed: {e}")
+
+        analysis = await asyncio.to_thread(engine.get_emotion_analysis, book_title)
+        
+        if not analysis.get('found'):
+            raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
+        
+        return analysis
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting book analysis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/books")
+async def get_top_books(limit: int = 50):
+    """
+    Get top books by rating
+    
+    Endpoint: GET /books
+    Returns top books sorted by rating (default: 50)
+    """
+    try:
+        try:
+            await ensure_engine_ready()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Engine initialization failed: {e}")
+
+        top_books = engine.get_top_books(limit=limit)
+        
+        books_response = []
+        for book in top_books:
+            thumbnail = json_safe(book.get('thumbnail'), None)
+            rating = json_safe(book.get('rating') or book.get('average_rating'), None)
+            description = json_safe(book.get('document_preview') or book.get('description'), None)
+
+            books_response.append({
+                "isbn13": str(json_safe(book.get('isbn13'), '')),
+                "title": str(json_safe(book.get('title'), '')),
+                "authors": json_safe(book.get('authors'), None),
+                "thumbnail": thumbnail,
+                "average_rating": float(rating) if rating is not None else None,
+                "description": description[:100] if description else None
+            })
+        
+        return {
+            "books": books_response,
+            "total": len(books_response)
+        }
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise
+        logger.error(f"Error getting top books: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/stats")
+async def get_engine_stats():
+    """
+    Get engine statistics
+    
+    Endpoint: GET /stats
+    Returns information about the recommendation engine state
+    """
+    try:
+        try:
+            await ensure_engine_ready()
+        except Exception:
+            # If engine can't be initialized, return empty stats with timestamp
+            return {"initialized": False, "timestamp": datetime.utcnow().isoformat()}
+
+        stats = engine.get_stats() if engine else {}
+        stats['timestamp'] = datetime.utcnow().isoformat()
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "name": settings.API_TITLE,
+        "version": settings.API_VERSION,
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "recommend": "POST /recommend",
+            "search": "GET /search",
+            "classify_emotion": "POST /classify-emotion",
+            "book_analysis": "GET /book/{book_title}",
+            "stats": "/stats",
+            "docs": "/docs"
+        }
+    }
+
+
+@app.get("/docs", include_in_schema=False)
+async def docs():
+    """Redirect to OpenAPI docs"""
+    return {"detail": "OpenAPI docs available at /docs"}
+
+
+# Error handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    """Handle HTTP exceptions"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
