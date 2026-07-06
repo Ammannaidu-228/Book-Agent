@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     # Vector DB Settings
     CHROMA_PERSIST_DIR: str = str(REPO_ROOT / "chroma_db")
     CHROMA_COLLECTION_NAME: str = "langchain"
+    AUTO_BOOTSTRAP_CHROMA: bool = True
+    CHROMA_BOOTSTRAP_BATCH_SIZE: int = 128
 
     @field_validator("CHROMA_PERSIST_DIR")
     @classmethod

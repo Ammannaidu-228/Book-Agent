@@ -398,6 +398,12 @@ async def classify_emotion(request: EmotionClassificationRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/classify-text", response_model=EmotionClassificationResponse)
+async def classify_text(request: EmotionClassificationRequest):
+    """Backward-compatible alias for clients still calling /classify-text."""
+    return await classify_emotion(request)
+
+
 @app.get("/search", response_model=SearchResponse)
 async def search_books(
     query: str = Query(..., min_length=1),

@@ -5,6 +5,7 @@ This loads the pre-built Chroma index created by init_chroma.py
 from ..config import settings
 import logging
 import os
+from pathlib import Path
 from typing import List, Dict
 
 logger = logging.getLogger(__name__)
@@ -49,10 +50,60 @@ class RAGPipeline:
                 collection_name=settings.CHROMA_COLLECTION_NAME,
             )
 
+            self._bootstrap_collection_if_empty()
+
             logger.info("RAG pipeline initialized successfully")
 
         except Exception as e:
             logger.error(f"Error initializing RAG pipeline: {e}")
+            raise
+
+    def _bootstrap_collection_if_empty(self):
+        """Build Chroma from packaged descriptions when deploys lack persisted vectors."""
+        try:
+            existing_count = self.db._collection.count()
+            if existing_count > 0:
+                return
+
+            if not settings.AUTO_BOOTSTRAP_CHROMA:
+                logger.warning("Chroma collection is empty and AUTO_BOOTSTRAP_CHROMA is disabled")
+                return
+
+            descriptions_path = Path(__file__).resolve().parents[2] / "data" / "raw" / "tagged_description.txt"
+            if not descriptions_path.exists():
+                logger.warning("Chroma collection is empty and %s was not found", descriptions_path)
+                return
+
+            logger.warning(
+                "Chroma collection is empty; bootstrapping vectors from %s. "
+                "This can take a few minutes on first deploy.",
+                descriptions_path,
+            )
+
+            texts = [
+                line.strip()
+                for line in descriptions_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            batch_size = max(1, settings.CHROMA_BOOTSTRAP_BATCH_SIZE)
+            for start in range(0, len(texts), batch_size):
+                batch = texts[start:start + batch_size]
+                ids = [
+                    text.split(maxsplit=1)[0] if text.split(maxsplit=1) else str(start + offset)
+                    for offset, text in enumerate(batch)
+                ]
+                self.db.add_texts(texts=batch, ids=ids)
+                logger.info(
+                    "Bootstrapped Chroma vectors: %s/%s",
+                    min(start + len(batch), len(texts)),
+                    len(texts),
+                )
+
+            logger.info("Chroma bootstrap complete: %s vectors", self.db._collection.count())
+
+        except Exception as e:
+            logger.error("Failed to bootstrap empty Chroma collection: %s", e)
             raise
     
     def search_similar_books(
