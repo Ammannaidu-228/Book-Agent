@@ -5,6 +5,7 @@ Organized in modular agentic AI project structure
 import logging
 import os
 import sys
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,6 +41,23 @@ logger = logging.getLogger(__name__)
 engine = None
 _initialization_error = None
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_data_file_path(filename: str):
+    """Resolve a data file from the repository root or common data locations."""
+    candidates = [
+        Path(filename),
+        Path.cwd() / filename,
+        REPO_ROOT / filename,
+        REPO_ROOT / "data" / "raw" / filename,
+        REPO_ROOT / "data" / filename,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
 
 def json_safe(value, default=None):
     """Convert pandas/numpy missing values into JSON-safe defaults."""
@@ -70,9 +88,10 @@ async def ensure_engine_ready():
                 engine = get_recommendation_engine()
 
             # Load dataset and initialize in a thread to avoid blocking event loop
-            if os.path.exists("books_with_emotions.csv"):
+            csv_path = resolve_data_file_path("books_with_emotions.csv")
+            if csv_path:
                 import pandas as pd
-                books_df = pd.read_csv("books_with_emotions.csv")
+                books_df = pd.read_csv(csv_path)
                 await asyncio.to_thread(engine.initialize, books_df)
             else:
                 logger.warning("books_with_emotions.csv not found; cannot initialize engine")

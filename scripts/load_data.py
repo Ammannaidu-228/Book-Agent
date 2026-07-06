@@ -5,12 +5,21 @@ import pandas as pd
 import logging
 import asyncio
 import os
+import sys
 import time
-from database import init_db, get_db
-from config import settings
-from db_models import create_book_document
-from embeddings import get_rag_pipeline
-from classifier import get_classifier
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+for path in [str(REPO_ROOT), str(SRC_ROOT)]:
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from src.database import init_db, get_db
+from src.database.db_models import create_book_document
+from src.core.embeddings import get_rag_pipeline
+from src.core.classifier import get_classifier
+from src.config import settings
 from tqdm import tqdm
 
 
@@ -32,16 +41,31 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def resolve_csv_path(csv_file: str) -> str:
+    """Resolve a CSV path relative to the repository root or common data locations."""
+    candidates = [
+        Path(csv_file),
+        REPO_ROOT / csv_file,
+        REPO_ROOT / "data" / "raw" / csv_file,
+        REPO_ROOT / "data" / csv_file,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(REPO_ROOT / "data" / "raw" / csv_file)
+
+
 async def load_books_to_db(csv_file: str = "books_with_emotions.csv"):
     """Load books from CSV into MongoDB"""
     try:
-        logger.info(f"Loading books from {csv_file}...")
+        resolved_csv = resolve_csv_path(csv_file)
+        logger.info(f"Loading books from {resolved_csv}...")
         
         # Initialize database
         await init_db()
         
         # Load CSV
-        df = pd.read_csv(csv_file)
+        df = pd.read_csv(resolved_csv)
         logger.info(f"Loaded {len(df)} books from CSV")
         
         # Get MongoDB database
@@ -95,10 +119,11 @@ async def load_books_to_db(csv_file: str = "books_with_emotions.csv"):
 async def initialize_vector_db(csv_file: str = "books_with_emotions.csv"):
     """Initialize vector database with book embeddings"""
     try:
-        logger.info("Initializing vector database...")
+        resolved_csv = resolve_csv_path(csv_file)
+        logger.info(f"Initializing vector database from {resolved_csv}...")
         
         # Load CSV
-        df = pd.read_csv(csv_file)
+        df = pd.read_csv(resolved_csv)
         
         # Initialize RAG pipeline
         rag = get_rag_pipeline()
