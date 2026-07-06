@@ -16,7 +16,7 @@ def print_section(title):
     print(f"  {title}")
     print(f"{'='*60}")
 
-def test_endpoint(method, path, description, data=None):
+def call_endpoint(method, path, description, data=None):
     """Test an API endpoint"""
     url = f"{BASE_URL}{path}"
     print(f"\n[{method}] {path}")
@@ -60,29 +60,29 @@ print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 # GET endpoints
 print_section("GET ENDPOINTS")
 
-test_endpoint("GET", "/", 
+call_endpoint("GET", "/", 
               "Root endpoint - API information")
 
-test_endpoint("GET", "/health",
+call_endpoint("GET", "/health",
               "Health check - API and service status")
 
-test_endpoint("GET", "/stats",
+call_endpoint("GET", "/stats",
               "Engine statistics - Current state and metrics")
 
-test_endpoint("GET", "/books?limit=3",
+call_endpoint("GET", "/books?limit=3",
               "Get top books - Top rated books from database")
 
-test_endpoint("GET", "/search?query=adventure&limit=5",
+call_endpoint("GET", "/search?query=adventure&limit=5",
               "Search books - Find books by semantic search")
 
 # POST endpoints  
 print_section("POST ENDPOINTS")
 
-test_endpoint("POST", "/classify-emotion",
+call_endpoint("POST", "/classify-emotion",
               "Classify emotions - Zero-shot emotion classification",
               {"text": "This is an amazing and wonderful book with great characters and adventure!"})
 
-test_endpoint("POST", "/recommend",
+call_endpoint("POST", "/recommend",
               "Get recommendations - Get similar book recommendations",
               {
                   "book": "Harry Potter and the Philosopher's Stone",

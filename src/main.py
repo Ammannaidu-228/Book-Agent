@@ -59,6 +59,17 @@ def resolve_data_file_path(filename: str):
     return None
 
 
+def describe_data_search_paths(filename: str):
+    """Return the data paths checked for diagnostics."""
+    return [
+        str(Path(filename)),
+        str(Path.cwd() / filename),
+        str(REPO_ROOT / filename),
+        str(REPO_ROOT / "data" / "raw" / filename),
+        str(REPO_ROOT / "data" / filename),
+    ]
+
+
 def json_safe(value, default=None):
     """Convert pandas/numpy missing values into JSON-safe defaults."""
     if value is None:
@@ -70,6 +81,80 @@ def json_safe(value, default=None):
     except (TypeError, ValueError):
         pass
     return value
+
+
+BOOK_FIELDS = {
+    "_id": 0,
+    "isbn13": 1,
+    "isbn10": 1,
+    "title": 1,
+    "authors": 1,
+    "categories": 1,
+    "description": 1,
+    "thumbnail": 1,
+    "published_year": 1,
+    "average_rating": 1,
+    "num_pages": 1,
+    "ratings_count": 1,
+    "embedding_id": 1,
+    "emotions": 1,
+}
+
+
+def normalize_book_document(book: dict) -> dict:
+    """Return a JSON-safe book document from MongoDB."""
+    rating = json_safe(book.get("average_rating"), None)
+    description = json_safe(book.get("description"), None)
+
+    return {
+        "isbn13": str(json_safe(book.get("isbn13"), "")),
+        "isbn10": json_safe(book.get("isbn10"), None),
+        "title": str(json_safe(book.get("title"), "")),
+        "authors": json_safe(book.get("authors"), None),
+        "categories": json_safe(book.get("categories"), None),
+        "category": json_safe(book.get("categories"), None),
+        "description": description,
+        "thumbnail": json_safe(book.get("thumbnail"), None),
+        "published_year": json_safe(book.get("published_year"), None),
+        "average_rating": float(rating) if rating is not None else None,
+        "rating": float(rating) if rating is not None else None,
+        "num_pages": json_safe(book.get("num_pages"), None),
+        "ratings_count": json_safe(book.get("ratings_count"), None),
+        "embedding_id": json_safe(book.get("embedding_id"), None),
+        "emotions": json_safe(book.get("emotions"), {}),
+    }
+
+
+def load_books_from_mongodb():
+    """Load all books from MongoDB into a dataframe-compatible list."""
+    db = get_db()
+    books = list(db["books"].find({}, BOOK_FIELDS))
+    return [normalize_book_document(book) for book in books]
+
+
+def load_books_dataframe():
+    """Load book metadata from MongoDB, falling back to the CSV if Mongo is empty."""
+    import pandas as pd
+
+    try:
+        mongo_books = load_books_from_mongodb()
+        if mongo_books:
+            logger.info("Loaded %s books from MongoDB", len(mongo_books))
+            return pd.DataFrame(mongo_books), "mongodb"
+        logger.warning("MongoDB books collection is empty; falling back to CSV if available")
+    except Exception as e:
+        logger.warning("Could not load books from MongoDB; falling back to CSV if available: %s", e)
+
+    csv_path = resolve_data_file_path("books_with_emotions.csv")
+    if csv_path:
+        logger.info("Loaded books from CSV fallback at %s", csv_path)
+        return pd.read_csv(csv_path), "csv"
+
+    logger.warning(
+        "No MongoDB books and books_with_emotions.csv not found; checked: %s",
+        describe_data_search_paths("books_with_emotions.csv"),
+    )
+    return pd.DataFrame(), "empty"
 
 
 async def ensure_engine_ready():
@@ -87,14 +172,13 @@ async def ensure_engine_ready():
             if engine is None:
                 engine = get_recommendation_engine()
 
-            # Load dataset and initialize in a thread to avoid blocking event loop
-            csv_path = resolve_data_file_path("books_with_emotions.csv")
-            if csv_path:
-                import pandas as pd
-                books_df = pd.read_csv(csv_path)
+            # Load dataset and initialize in a thread to avoid blocking event loop.
+            books_df, source = await asyncio.to_thread(load_books_dataframe)
+            if not books_df.empty:
+                logger.info("Initializing recommendation engine with %s book data", source)
                 await asyncio.to_thread(engine.initialize, books_df)
             else:
-                logger.warning("books_with_emotions.csv not found; cannot initialize engine")
+                logger.warning("No books available to initialize recommendation engine")
 
         except Exception as e:
             logger.error(f"Failed to initialize engine lazily: {e}")
@@ -128,18 +212,19 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Database initialization failed (non-critical): {e}")
         
-        # Load books data (import pandas lazily to avoid heavy startup import)
+        # Warm up the engine if MongoDB already has books. Heavy components still
+        # initialize in the background so startup stays fast.
         try:
             logger.info("Loading books data...")
-            if not os.path.exists("books_with_emotions.csv"):
-                logger.warning("books_with_emotions.csv not found - engine will use lazy initialization")
-                engine = None
-            else:
-                # Defer loading of the dataset and initialization of heavy models until first request
-                logger.info("books_with_emotions.csv present — engine will initialize lazily on first use")
+            books_count = await asyncio.to_thread(lambda: get_db()["books"].count_documents({}))
+            if books_count > 0:
+                logger.info("MongoDB books collection has %s books; engine will initialize lazily on first use", books_count)
                 engine = None
                 global engine_init_task
                 engine_init_task = asyncio.create_task(_background_engine_initialization())
+            else:
+                logger.warning("MongoDB books collection is empty - run `python -m scripts.load_data` to load books")
+                engine = None
         except Exception as e:
             logger.warning(f"Engine initialization deferred: {e}")
             engine = None
@@ -248,15 +333,10 @@ async def recommend(request: RecommendationRequest):
                 min_similarity=settings.SIMILARITY_THRESHOLD
             )
         
-        recommendations, query_info = await asyncio.to_thread(get_recs)
-        
-        if not query_info.get('found'):
-            raise HTTPException(
-                status_code=404,
-                detail=f"Book '{request.book}' not found in database"
-            )
-        
-        # Convert to response format
+        recommendations, query_info = await asyncio.wait_for(
+            asyncio.to_thread(get_recs),
+            timeout=settings.RECOMMENDATION_TIMEOUT
+        )
         recommendation_responses = [
             BookResponse(
                 isbn13=book.get('isbn13', ''),
@@ -402,14 +482,25 @@ async def get_top_books(limit: int = 50):
     """
     try:
         try:
-            await ensure_engine_ready()
+            db = get_db()
+            cursor = (
+                db["books"]
+                .find({}, BOOK_FIELDS)
+                .sort("average_rating", -1)
+                .limit(limit)
+            )
+            top_books = await asyncio.to_thread(lambda: list(cursor))
         except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Engine initialization failed: {e}")
-
-        top_books = engine.get_top_books(limit=limit)
+            logger.warning("MongoDB books query failed, falling back to recommendation engine: %s", e)
+            try:
+                await ensure_engine_ready()
+            except Exception as init_error:
+                raise HTTPException(status_code=503, detail=f"Books unavailable: {init_error}")
+            top_books = engine.get_top_books(limit=limit)
         
         books_response = []
         for book in top_books:
+            book = normalize_book_document(book)
             thumbnail = json_safe(book.get('thumbnail'), None)
             rating = json_safe(book.get('rating') or book.get('average_rating'), None)
             description = json_safe(book.get('document_preview') or book.get('description'), None)

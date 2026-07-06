@@ -42,9 +42,11 @@ class RAGPipeline:
                     "Please run: python -m src.scripts.init_chroma"
                 )
 
+            logger.info("Loading Chroma database from %s", os.path.abspath(settings.CHROMA_PERSIST_DIR))
             self.db = Chroma(
                 persist_directory=settings.CHROMA_PERSIST_DIR,
-                embedding_function=self.embeddings
+                embedding_function=self.embeddings,
+                collection_name=settings.CHROMA_COLLECTION_NAME,
             )
 
             logger.info("RAG pipeline initialized successfully")
@@ -102,13 +104,17 @@ class RAGPipeline:
             # Get count from Chroma collection
             count = self.db._collection.count()
             return {
-                'collection_name': 'books',
+                'collection_name': settings.CHROMA_COLLECTION_NAME,
                 'total_books': count,
                 'embedding_model': settings.EMBEDDING_MODEL
             }
         except Exception as e:
             logger.error(f"Error getting collection stats: {e}")
-            return {'collection_name': 'books', 'total_books': 0, 'embedding_model': settings.EMBEDDING_MODEL}
+            return {
+                'collection_name': settings.CHROMA_COLLECTION_NAME,
+                'total_books': 0,
+                'embedding_model': settings.EMBEDDING_MODEL,
+            }
 
 
 # Global RAG pipeline instance

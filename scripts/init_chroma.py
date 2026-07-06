@@ -14,10 +14,14 @@ from langchain_text_splitters import CharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 
-from config import settings
+from src.config import settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BOOKS_CSV = REPO_ROOT / "data" / "raw" / "books_with_emotions.csv"
+TAGGED_DESCRIPTIONS = REPO_ROOT / "data" / "raw" / "tagged_description.txt"
 
 
 def backup_existing_chroma():
@@ -33,12 +37,12 @@ def backup_existing_chroma():
 def create_tagged_descriptions():
     """Create tagged_description.txt from CSV"""
     logger.info("Loading books from CSV...")
-    books = pd.read_csv("books_with_emotions.csv")
+    books = pd.read_csv(BOOKS_CSV)
     
     logger.info(f"Creating tagged descriptions for {len(books)} books...")
     
     # Create tagged descriptions: ISBN13 + description
-    with open("tagged_description.txt", "w", encoding="utf-8") as f:
+    with open(TAGGED_DESCRIPTIONS, "w", encoding="utf-8") as f:
         for _, row in books.iterrows():
             isbn = str(row['isbn13'])
             description = str(row.get('description', ''))
@@ -52,7 +56,7 @@ def create_tagged_descriptions():
 def build_chroma_index():
     """Build Chroma index from tagged descriptions"""
     logger.info("Loading documents...")
-    raw_documents = TextLoader("tagged_description.txt", encoding="utf-8").load()
+    raw_documents = TextLoader(str(TAGGED_DESCRIPTIONS), encoding="utf-8").load()
     
     logger.info("Splitting documents...")
     text_splitter = CharacterTextSplitter(separator="\n", chunk_size=1, chunk_overlap=0)
@@ -68,7 +72,8 @@ def build_chroma_index():
             openai_api_key=settings.OPENAI_API_KEY,
             model=settings.EMBEDDING_MODEL
         ),
-        persist_directory=settings.CHROMA_PERSIST_DIR
+        persist_directory=settings.CHROMA_PERSIST_DIR,
+        collection_name=settings.CHROMA_COLLECTION_NAME,
     )
     
     logger.info(f"✓ Chroma index built successfully with {len(documents)} documents")
@@ -84,7 +89,8 @@ def verify_index(books_df):
         embedding_function=OpenAIEmbeddings(
             openai_api_key=settings.OPENAI_API_KEY,
             model=settings.EMBEDDING_MODEL
-        )
+        ),
+        collection_name=settings.CHROMA_COLLECTION_NAME,
     )
     
     # Test search

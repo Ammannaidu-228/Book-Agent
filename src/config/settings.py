@@ -2,7 +2,12 @@
 Configuration settings for the Lit-Pick backend
 """
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 from typing import Optional
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
@@ -21,14 +26,25 @@ class Settings(BaseSettings):
     DATABASE_NAME: str = "litpick"
     
     # Vector DB Settings
-    CHROMA_PERSIST_DIR: str = "./chroma_db"
+    CHROMA_PERSIST_DIR: str = str(REPO_ROOT / "chroma_db")
+    CHROMA_COLLECTION_NAME: str = "langchain"
+
+    @field_validator("CHROMA_PERSIST_DIR")
+    @classmethod
+    def resolve_chroma_persist_dir(cls, value: str) -> str:
+        path = Path(value)
+        if path.is_absolute():
+            return str(path)
+        return str((REPO_ROOT / path).resolve())
     
     # Performance Settings
     MAX_WORKERS: int = 4
     BATCH_SIZE: int = 8
     CACHE_TTL: int = 3600  # 1 hour
     CONNECTION_POOL_SIZE: int = 20
-    
+    RECOMMENDATION_TIMEOUT: int = 25
+    ENABLE_EMOTION_CLASSIFICATION: bool = False
+
     # Emotion Classification Settings
     EMOTION_MODEL: str = "facebook/bart-large-mnli"
     EMOTIONS: list = [

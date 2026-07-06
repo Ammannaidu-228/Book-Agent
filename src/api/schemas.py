@@ -32,7 +32,10 @@ class RecommendationRequest(BaseModel):
     """Request model for book recommendations"""
     book: str = Field(..., min_length=1, description="Book title to get recommendations for")
     top_k: int = Field(10, ge=1, le=50, description="Number of recommendations to return")
-    include_emotions: bool = Field(True, description="Include emotion scores in response")
+    include_emotions: bool = Field(
+        False,
+        description="Include emotion scores in response. Set true for slower results with emotional metadata."
+    )
 
 
 class RecommendationResponse(BaseModel):

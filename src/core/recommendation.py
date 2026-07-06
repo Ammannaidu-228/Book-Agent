@@ -196,29 +196,32 @@ class RecommendationEngine:
                     if len(filtered_books) >= top_k:
                         break
             
-            # Add emotions if requested
+            # Add emotions if requested and enabled
             if include_emotions:
-                if self.classifier is None:
-                    self.classifier = get_classifier()
-                for book in filtered_books:
-                    try:
-                        cache_key = book.get("isbn13") or book.get("title")
-                        if cache_key and cache_key in self.emotion_cache:
-                            emotions, top_emotion = self.emotion_cache[cache_key]
-                        else:
-                            emotions, top_emotion = self.classifier.classify_book(
-                                title=book.get('title', ''),
-                                description=book.get('document_preview', ''),
-                                authors=book.get('authors', '')
-                            )
-                            if cache_key:
-                                self.emotion_cache[cache_key] = (emotions, top_emotion)
-                        book['emotions'] = emotions
-                        book['top_emotion'] = top_emotion
-                        book['match_reason'] = f"Similar to {book_title}. Emotional themes: {', '.join(list(emotions.keys())[:3])}"
-                    except Exception as e:
-                        logger.error(f"Error classifying emotions for {book.get('title')}: {e}")
-                        book['emotions'] = None
+                if not settings.ENABLE_EMOTION_CLASSIFICATION:
+                    logger.info("Emotion classification disabled by configuration; skipping emotion metadata.")
+                else:
+                    if self.classifier is None:
+                        self.classifier = get_classifier()
+                    for book in filtered_books:
+                        try:
+                            cache_key = book.get("isbn13") or book.get("title")
+                            if cache_key and cache_key in self.emotion_cache:
+                                emotions, top_emotion = self.emotion_cache[cache_key]
+                            else:
+                                emotions, top_emotion = self.classifier.classify_book(
+                                    title=book.get('title', ''),
+                                    description=book.get('document_preview', ''),
+                                    authors=book.get('authors', '')
+                                )
+                                if cache_key:
+                                    self.emotion_cache[cache_key] = (emotions, top_emotion)
+                            book['emotions'] = emotions
+                            book['top_emotion'] = top_emotion
+                            book['match_reason'] = f"Similar to {book_title}. Emotional themes: {', '.join(list(emotions.keys())[:3])}"
+                        except Exception as e:
+                            logger.error(f"Error classifying emotions for {book.get('title')}: {e}")
+                            book['emotions'] = None
             
             processing_time = (time.time() - start_time) * 1000  # Convert to ms
             
